@@ -1,70 +1,94 @@
 import re
 from typing import List, Dict, Any
 from datetime import datetime, timezone
-
 from bs4 import BeautifulSoup
 
 AUTO24_SEARCH = "https://www.auto24.ee/soidukid/kasutatud/"
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; CarSniperBot/0.1; +https://example.com)"
+    # важен нормальный User-Agent
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 }
 
 async def fetch_latest_listings(session) -> List[Dict[str, Any]]:
     """
-    Minimalistic parser that tries to discover latest listings
-    on the first page of Auto24 used cars list.
-    NOTE: This is a heuristic and may break if markup changes.
+    Эвристический парсер первой страницы. Ищет ссылки с id= и вытаскивает базовые поля.
+    Маркап может меняться — это MVP.
     """
-    url = AUTO24_SEARCH
-    async with session.get(url, headers=HEADERS) as resp:
+    items: List[Dict[str, Any]] = []
+
+    async with session.get(AUTO24_SEARCH, headers=HEADERS) as resp:
+        status = resp.status
         html = await resp.text()
 
-    soup = BeautifulSoup(html, "html.parser")
-    items = []
+    if status != 200 or not html:
+        return items
 
-    # Heuristics: find anchors pointing to detail pages that look like '/soidukid/used/...id=XXXX'
+    soup = BeautifulSoup(html, "html.parser")
+
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        if "auto24.ee" not in href:
-            full = "https://www.auto24.ee" + href if href.startswith("/") else None
-        else:
+        # нормализуем абсолютную ссылку
+        if href.startswith("/"):
+            full = "https://www.auto24.ee" + href
+        elif href.startswith("http"):
             full = href
-
-        if not full or "/soidukid/" not in full:
+        else:
             continue
 
-        # Normalize id
+        # интересуют карточки объявлений
+        if "/soidukid/" not in full:
+            continue
+
         m = re.search(r"id=(\d+)", full)
         if not m:
             continue
         ad_id = m.group(1)
 
-        # Try to grab the card container to extract text (title/price/year/km/brand)
+        # Пытаемся взять контейнер текста
         card = a.find_parent(["article", "div", "li"]) or a
         text = " ".join(card.get_text(" ").split())
-        title = a.get_text(strip=True) or "Auto24 Listing"
+        title = a.get_text(strip=True) or "Listing"
 
-        # Extract numbers
+        # Цена (в евро)
         price = None
         mprice = re.search(r"(\d[\d\s]{2,})\s*€", text)
         if mprice:
-            price = int(mprice.group(1).replace(" ", ""))
+            try:
+                price = int(mprice.group(1).replace(" ", ""))
+            except:
+                pass
 
+        # Год
         year = None
         myear = re.search(r"\b(20\d{2}|19\d{2})\b", text)
         if myear:
-            year = int(myear.group(1))
+            try:
+                year = int(myear.group(1))
+            except:
+                pass
 
+        # Пробег
         km = None
         mkm = re.search(r"(\d[\d\s]{2,})\s*(?:km|KM)", text)
         if mkm:
-            km = int(mkm.group(1).replace(" ", ""))
+            try:
+                km = int(mkm.group(1).replace(" ", ""))
+            except:
+                pass
 
-        # crude brand from title
+        # Бренд (грубо по тексту)
         brand = None
-        for b in ["Toyota","BMW","Mercedes","Mercedes-Benz","Skoda","Škoda","VW","Volkswagen","Audi"]:
-            if b.lower() in text.lower():
-                brand = "Volkswagen" if b.lower() in ["vw","volkswagen"] else b
+        brands = ["Toyota","BMW","Mercedes","Mercedes-Benz","Skoda","Škoda","VW","Volkswagen","Audi",
+                  "Volvo","Honda","Ford","Nissan","Hyundai","Kia","Peugeot","Opel","Mazda","Renault"]
+        lower = text.lower()
+        for b in brands:
+            if b.lower() in lower:
+                if b.lower() in ["vw","volkswagen"]:
+                    brand = "Volkswagen"
+                elif "mercedes" in b.lower():
+                    brand = "Mercedes-Benz"
+                else:
+                    brand = b
                 break
 
         items.append({
@@ -76,10 +100,10 @@ async def fetch_latest_listings(session) -> List[Dict[str, Any]]:
             "year": year,
             "odometer_km": km,
             "brand": brand,
-            "fetched_at": datetime.now(timezone.utc).isoformat()
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
         })
 
-    # Deduplicate by id
+    # дедуп
     seen = set()
     uniq = []
     for it in items:
@@ -88,5 +112,5 @@ async def fetch_latest_listings(session) -> List[Dict[str, Any]]:
         seen.add(it["id"])
         uniq.append(it)
 
-    # Only keep a reasonable number
+    # ограничим чтобы не спамить
     return uniq[:60]
