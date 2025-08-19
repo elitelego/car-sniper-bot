@@ -120,11 +120,22 @@ async def brands_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Планировщик: регулярный скан и рассылка ---
 async def scan_job(context: ContextTypes.DEFAULT_TYPE):
-    """Запускается каждые SCAN_INTERVAL секунд."""
-    # 1) получаем пользователей и их фильтры
-    #   В твоём минимальном db.py хранится только свой фильтр в виде текста;
-    #   если нужно на нескольких пользователей — добавь таблицу пользователей.
-    #   Здесь просто пример: отправляем результат самому себе (или всем, если есть список).
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+        try:
+            listings: List[Dict[str, Any]] = await fetch_latest_listings(session)
+        except Exception as e:
+            logger.exception("Fetch error: %s", e)
+            return
+
+    if not listings:
+        logger.info("Новых объявлений нет")
+        return
+
+    # выведем первые 3 URL для контроля
+    preview = ", ".join([l.get("url","") for l in listings[:3]])
+    logger.info("Найдено объявлений: %d. Примеры: %s", len(listings), preview)
+
+    # TODO: здесь фильтруем по БД и шлём пользователям подходящие варианты
 
     # 2) создаём HTTP-сессию и передаём её в парсер
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
