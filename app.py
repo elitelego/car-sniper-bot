@@ -82,7 +82,7 @@ def parse_filters_text(s: str) -> Dict[str, Any]:
             out["price_min"] = int(m.group(1)); out["price_max"] = int(m.group(2))
     # year
     if len(parts) > 1 and parts[1]:
-        m = re.match(r"^\s*(\d{4})-\s*(\d{4})\s*$", parts[1])
+        m = re.match(r"^\s*(\d{4})-(\d{4})\s*$", parts[1])
         if m:
             out["year_min"] = int(m.group(1)); out["year_max"] = int(m.group(2))
     # km
@@ -178,6 +178,8 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Нашёл {len(listings)} объявлений. Показал первые {len(preview)}.")
 
 # ------------ МАСТЕР ФИЛЬТРОВ ------------
+PRICE, YEAR, KM, BRANDS = range(4)
+
 async def filter_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["filt"] = {"price_min": None,"price_max": None,"year_min": None,"year_max": None,"km_max": None,"brands": []}
     await update.message.reply_text("Укажи диапазон цены (например: 2000-6000):")
@@ -306,7 +308,7 @@ def build_app():
             BRANDS: [CallbackQueryHandler(brands_toggle)],
         },
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
-        allow_reentry=True  # <-- per_message не используем, чтобы не было предупреждений
+        allow_reentry=True
     )
 
     app.add_handler(CommandHandler("start", cmd_start))
