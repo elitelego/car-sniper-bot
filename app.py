@@ -38,7 +38,6 @@ BRANDS_ALL = [
 # Защита от повторной рассылки (на время жизни процесса)
 SEEN: set = set()
 
-
 # ------------ ВСПОМОГАТЕЛЬНЫЕ ------------
 def normalize_brand(b: str) -> str:
     lb = (b or "").strip().lower()
@@ -113,7 +112,6 @@ def is_match(item: Dict[str, Any], f: Dict[str, Any]) -> bool:
         if not brand or brand not in f["brands"]: return False
     return True
 
-
 # ------------ ОТПРАВКА ------------
 async def send_listing(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, listing: Dict[str, Any]):
     title = listing.get("title") or "Новое объявление"
@@ -132,17 +130,52 @@ async def send_listing(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, listing: Di
     )
     await ctx.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown", disable_web_page_preview=True)
 
-
 # ------------ КОМАНДЫ ------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Я пришлю тебе новые объявления по твоим фильтрам.\n\n"
-        "🔧 Набери /filter чтобы настроить фильтры пошагово."
+        "🔧 Набери /filter чтобы настроить фильтры пошагово.\n"
+        "Для проверки парсера: /debug"
     )
 
 async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Ваш chat_id: {update.effective_chat.id}")
 
+async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ручная проверка парсера: пришлём в чат первые 3 объявления без фильтрации."""
+    await update.message.reply_text("⏳ Проверяю auto24…")
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+        try:
+            listings = await fetch_latest_listings(session)
+        except Exception as e:
+            logger.exception("Debug fetch error: %s", e)
+            await update.message.reply_text(f"❌ Ошибка парсера: {e}")
+            return
+
+    if not listings:
+        await update.message.reply_text("⚠️ Парсер вернул 0 объявлений. Попробуем позже или расширим эвристику.")
+        return
+
+    preview = listings[:3]
+    for it in preview:
+        url = it.get("url", "")
+        title = it.get("title") or "Объявление"
+        price = it.get("price_eur")
+        year = it.get("year")
+        km = it.get("odometer_km")
+        brand = it.get("brand") or "-"
+        text = (
+            f"🔎 *Проверка*\n"
+            f"{title}\n"
+            f"Марка: {brand} • Год: {year} • Пробег: {km} • Цена: {price} €\n"
+            f"[Открыть]({url})"
+        )
+        try:
+            await context.bot.send_message(chat_id=update.effective_chat.id, text=text, parse_mode="Markdown", disable_web_page_preview=True)
+        except Exception as e:
+            logger.exception("Debug send failed: %s", e)
+
+    await update.message.reply_text(f"✅ Нашёл {len(listings)} объявлений. Показал первые {len(preview)}.")
 
 # ------------ МАСТЕР ФИЛЬТРОВ ------------
 async def filter_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -211,7 +244,6 @@ async def brands_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     if data == "confirm:save":
-        # ⬇️ ВАЖНО: объявляем f и формируем строку для БД
         f = context.user_data.get("filt", {})
         price_s  = f"{f.get('price_min','')}-{f.get('price_max','')}"
         year_s   = f"{f.get('year_min','')}-{f.get('year_max','')}"
@@ -219,7 +251,6 @@ async def brands_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         brands_s = ",".join(f.get("brands", []))
         s = f"{price_s}|{year_s}|{km_s}|{brands_s}"
 
-        # chat_id корректнее брать так:
         chat_id = q.message.chat.id
         save_filters(chat_id, s)
 
@@ -229,7 +260,6 @@ async def brands_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Отменено.")
     return ConversationHandler.END
-
 
 # ------------ СКАН И РАССЫЛКА ------------
 async def scan_job(context: ContextTypes.DEFAULT_TYPE):
@@ -260,7 +290,6 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE):
                 except Exception as e:
                     logger.exception("Send failed to %s: %s", user_id, e)
 
-
 # ------------ СБОРКА И ЗАПУСК ------------
 def build_app():
     if not BOT_TOKEN:
@@ -277,11 +306,13 @@ def build_app():
             BRANDS: [CallbackQueryHandler(brands_toggle)],
         },
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
-        allow_reentry=True
+        allow_reentry=True,
+        per_message=True  # убираем предупреждение PTB про отслеживание
     )
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
+    app.add_handler(CommandHandler("debug", cmd_debug))
     app.add_handler(conv)
 
     # Планировщик через JobQueue (обязательно: python-telegram-bot[job-queue])
