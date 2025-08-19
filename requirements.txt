@@ -1,3 +1,4 @@
 python-telegram-bot==20.3
 aiohttp
 pip install -r requirements.txt
+source venv/bin/activate
