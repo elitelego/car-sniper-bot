@@ -1,23 +1,93 @@
-import os, re, logging, aiohttp
+#!/usr/bin/env python3
+import logging
+import os
+import re
+from typing import Dict, Any, List, Tuple, Optional
+
+import aiohttp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, CallbackQueryHandler, filters
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, ContextTypes,
+    CallbackQueryHandler, MessageHandler, ConversationHandler, filters
+)
+
 from db import init_db, save_filters, get_filters, all_users_filters
 from scraper.auto24 import fetch_latest_listings
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("bot")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("car-sniper")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL","60"))
-PRICE,YEAR,KM,BRANDS=range(4)
+BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Используй /filter для настройки фильтров.")
+# Состояния мастера
+PRICE, YEAR, KM, BRANDS = range(4)
 
-def main():
-    init_db()
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.run_polling()
+# 15 популярных брендов
+BRANDS_ALL = [
+    "Toyota","BMW","Mercedes-Benz","Audi","Volkswagen",
+    "Skoda","Volvo","Honda","Ford","Nissan",
+    "Hyundai","Kia","Peugeot","Opel","Mazda"
+]
 
-if __name__=='__main__': main()
+# Простая защита от повторов (на период жизни процесса)
+SEEN: set[str] = set()
+
+def normalize_brand(b: str) -> str:
+    lb = (b or "").strip().lower()
+    if lb in ["vw", "volkswagen"]:
+        return "Volkswagen"
+    if "mercedes" in lb:
+        return "Mercedes-Benz"
+    for x in BRANDS_ALL:
+        if x.lower() == lb:
+            return x
+    return (b or "").strip()
+
+def brands_keyboard(selected: List[str]) -> InlineKeyboardMarkup:
+    rows = []
+    for i in range(0, len(BRANDS_ALL), 3):
+        row = []
+        for b in BRANDS_ALL[i:i+3]:
+            mark = "✅" if normalize_brand(b) in selected else "▫️"
+            row.append(InlineKeyboardButton(f"{mark} {b}", callback_data=f"brand:{b}"))
+        rows.append(row)
+    rows.append([
+        InlineKeyboardButton("✅ Сохранить", callback_data="confirm:save"),
+        InlineKeyboardButton("❌ Отмена",   callback_data="confirm:cancel")
+    ])
+    return InlineKeyboardMarkup(rows)
+
+def fmt_int(x: Optional[int]) -> str:
+    if x is None:
+        return "-"
+    return f"{x:,}".replace(",", " ")
+
+def parse_filters_text(s: str) -> Dict[str, Any]:
+    # формат: "2000-6000|2006-2020|250000|toyota,bmw"
+    out = {"price_min":None,"price_max":None,"year_min":None,"year_max":None,"km_max":None,"brands":[]}
+    if not s:
+        return out
+    parts = s.split("|")
+    # price
+    if len(parts) > 0 and parts[0]:
+        m = re.match(r"^\s*(\d+)\s*-\s*(\d+)\s*$", parts[0])
+        if m:
+            out["price_min"] = int(m.group(1)); out["price_max"] = int(m.group(2))
+    # year
+    if len(parts) > 1 and parts[1]:
+        m = re.match(r"^\s*(\d{4})\s*-\s*(\d{4})\s*$", parts[1])
+        if m:
+            out["year_min"] = int(m.group(1)); out["year_max"] = int(m.group(2))
+    # km
+    if len(parts) > 2 and parts[2]:
+        try:
+            out["km_max"] = int(parts[2].strip())
+        except:
+            pass
+    # brands
+    if len(parts) > 3 and parts[3]:
+        brands =
