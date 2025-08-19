@@ -36,16 +36,42 @@ BRANDS_ALL = [
 # Простая защита от повторов (на период жизни процесса)
 SEEN: set[str] = set()
 
-def normalize_brand(b: str) -> str:
-    lb = (b or "").strip().lower()
-    if lb in ["vw", "volkswagen"]:
-        return "Volkswagen"
-    if "mercedes" in lb:
-        return "Mercedes-Benz"
-    for x in BRANDS_ALL:
-        if x.lower() == lb:
-            return x
-    return (b or "").strip()
+async def brands_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data
+
+    if data.startswith("brand:"):
+        brand = data.split(":", 1)[1]
+        sel = context.user_data["filt"].get("brands", [])
+        nb = normalize_brand(brand)
+        if nb in sel:
+            sel.remove(nb)
+        else:
+            sel.append(nb)
+        context.user_data["filt"]["brands"] = sel
+        await q.edit_message_reply_markup(reply_markup=brands_keyboard(sel))
+        return BRANDS
+
+    if data == "confirm:cancel":
+        await q.edit_message_text("Отменено.")
+        return ConversationHandler.END
+
+    if data == "confirm:save":
+        # ⚡️ вот здесь мы объявляем f, чтобы не было NameError
+        f = context.user_data.get("filt", {})
+
+        price_s  = f"{f.get('price_min','')}-{f.get('price_max','')}"
+        year_s   = f"{f.get('year_min','')}-{f.get('year_max','')}"
+        km_s     = f"{f.get('km_max','')}"
+        brands_s = ",".join(f.get("brands", []))
+
+        s = f"{price_s}|{year_s}|{km_s}|{brands_s}"
+        save_filters(q.message.chat_id, s)
+
+        await q.edit_message_text("✅ Фильтр сохранён!")
+        return ConversationHandler.END
+
 
 def brands_keyboard(selected: List[str]) -> InlineKeyboardMarkup:
     rows = []
