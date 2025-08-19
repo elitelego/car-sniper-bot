@@ -1,0 +1,18 @@
+services:
+  - type: worker
+    name: car-sniper-bot
+    env: python
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python app.py"
+    plan: starter
+    autoDeploy: true
+    disk:
+      name: data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: DB_PATH
+        value: /data/data.db
+      - key: SCAN_INTERVAL
+        value: "60"
+      # Add BOT_TOKEN in the Render dashboard (marked as Secret)
