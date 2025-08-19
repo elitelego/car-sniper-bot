@@ -12,8 +12,6 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, ContextTypes,
     CallbackQueryHandler, MessageHandler, ConversationHandler, filters
 )
-
-from db import init_db, save_filters, get_filters, all_users_filters
 from scraper.auto24 import fetch_latest_listings
 
 logging.basicConfig(
