@@ -82,7 +82,7 @@ def parse_filters_text(s: str) -> Dict[str, Any]:
             out["price_min"] = int(m.group(1)); out["price_max"] = int(m.group(2))
     # year
     if len(parts) > 1 and parts[1]:
-        m = re.match(r"^\s*(\d{4})\s*-\s*(\d{4})\s*$", parts[1])
+        m = re.match(r"^\s*(\d{4})-\s*(\d{4})\s*$", parts[1])
         if m:
             out["year_min"] = int(m.group(1)); out["year_max"] = int(m.group(2))
     # km
@@ -306,8 +306,7 @@ def build_app():
             BRANDS: [CallbackQueryHandler(brands_toggle)],
         },
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
-        allow_reentry=True,
-        per_message=True  # убираем предупреждение PTB про отслеживание
+        allow_reentry=True  # <-- per_message не используем, чтобы не было предупреждений
     )
 
     app.add_handler(CommandHandler("start", cmd_start))
