@@ -88,6 +88,9 @@ def parse_filters_text(s: str) -> Dict[str, Any]:
             out["km_max"] = int(parts[2].strip())
         except:
             pass
-    # brands
-    if len(parts) > 3 and parts[3]:
-        brands =
+    price_s  = f"{f.get('price_min','')}-{f.get('price_max','')}"
+year_s   = f"{f.get('year_min','')}-{f.get('year_max','')}"
+km_s     = f"{f.get('km_max','')}"
+brands_s = ",".join(f.get("brands", []))
+s = f"{price_s}|{year_s}|{km_s}|{brands_s}"
+
