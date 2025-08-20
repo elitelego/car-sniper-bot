@@ -4,13 +4,11 @@ from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone
 from bs4 import BeautifulSoup
 
-# Используем мобильную выдачу как основную — она у тебя даёт 200 OK
+# Мобилка у тебя отдаёт 200 — используем её как основной источник
 MOBILE_URL  = "https://m.auto24.ee/soidukid/kasutatud/"
 DESKTOP_URL = "https://www.auto24.ee/soidukid/kasutatud/"  # запасной
 
-# Если задан SCRAPER_URL_TMPL, все запросы пойдут через него:
-# пример для ScraperAPI:
-# SCRAPER_URL_TMPL = "https://api.scraperapi.com/?api_key=XXX&country_code=EE&keep_headers=true&url={url}"
+# Прокси-шаблон (например ScraperAPI). Если пусто — идём напрямую.
 SCRAPER_URL_TMPL = os.getenv("SCRAPER_URL_TMPL")
 
 HDRS = {
@@ -37,8 +35,7 @@ def _norm_url(href: str) -> Optional[str]:
     if not href:
         return None
     if href.startswith("/"):
-        # мобилка всегда под доменом m.auto24.ee
-        return "https://m.auto24.ee" + href
+        return "https://m.auto24.ee" + href  # моб. домен
     if href.startswith("http"):
         return href
     return None
@@ -50,54 +47,90 @@ def _canon_brand(raw: Optional[str]) -> Optional[str]:
     if "mercedes" in s: return "Mercedes-Benz"
     return raw.strip()
 
-def _extract_int(pattern: str, text: str) -> Optional[int]:
-    m = re.search(pattern, text, re.I)
-    if not m: return None
+# ---------- НОВЫЕ АККУРАТНЫЕ ПАРСЕРЫ ЧИСЕЛ ----------
+PRICE_MIN, PRICE_MAX = 100, 200_000
+KM_MAX = 1_000_000
+YEAR_MIN, YEAR_MAX = 1990, 2026
+
+def _to_int(s: str) -> Optional[int]:
     try:
-        return int(m.group(1).replace(" ", "").replace("\u00a0", ""))
-    except: return None
+        return int(s.replace(" ", "").replace("\u00a0", ""))
+    except:
+        return None
 
-def _extract_year(text: str) -> Optional[int]:
-    m = re.search(r"\b(20\d{2}|19\d{2})\b", text)
-    return int(m.group(1)) if m else None
+def extract_price(text: str) -> Optional[int]:
+    """
+    Берём все числа непосредственно перед символом €, выбираем адекватное.
+    Примеры совпадений: '14 990 €', '2990€'
+    """
+    cands: List[int] = []
+    for m in re.finditer(r"(\d{1,3}(?:[ \u00a0]\d{3})+|\d+)\s*€", text):
+        v = _to_int(m.group(1))
+        if v is not None and PRICE_MIN <= v <= PRICE_MAX:
+            cands.append(v)
+    if cands:
+        # обычно на карточке «реальная» цена — наименьшая из адекватных чисел
+        return min(cands)
+    return None
 
-def _guess_brand(text: str) -> Optional[str]:
+def extract_km(text: str) -> Optional[int]:
+    """
+    Ищем км с допуском на пробелы/неразрывные пробелы/регистры.
+    Примеры: '245 000 km', '125000km'
+    """
+    cands: List[int] = []
+    for m in re.finditer(r"(\d{1,3}(?:[ \u00a0]\d{3})+|\d+)\s*(?:km|KM|Km|kM)\b", text):
+        v = _to_int(m.group(1))
+        if v is not None and 0 < v <= KM_MAX:
+            cands.append(v)
+    if cands:
+        return min(cands)
+    return None
+
+def extract_year(text: str) -> Optional[int]:
+    """
+    Берём годы в диапазоне 1990–2026. Если в карточке встречается несколько чисел (например, месяц/год),
+    берём первый адекватный год.
+    """
+    for m in re.finditer(r"\b(20\d{2}|19\d{2})\b", text):
+        y = int(m.group(1))
+        if YEAR_MIN <= y <= YEAR_MAX:
+            return y
+    return None
+
+def guess_brand(text: str) -> Optional[str]:
     low = text.lower()
     for b in BRAND_LIST:
         if b.lower() in low:
             return _canon_brand(b)
     return None
 
+# ---------------------------------------------------
+
+def _extract_ad_id(url: str) -> Optional[str]:
+    # поддерживаем несколько форматов
+    m = re.search(r"[?&]id=(\d+)", url)
+    if m: return m.group(1)
+    m = re.search(r"/(\d{5,})(?:$|/|\?)", url)
+    if m: return m.group(1)
+    return None
+
 def _parse_card_text(tag) -> Dict[str, Any]:
-    """Извлекаем данные из ближайшего контейнера карточки."""
     card = tag.find_parent(["article","div","li"]) or tag
     text = " ".join(card.get_text(" ").split())
     title = tag.get_text(strip=True) or "Listing"
-    price = _extract_int(r"(\d[\d\s]{2,})\s*€", text)
-    km    = _extract_int(r"(\d[\d\s]{2,})\s*(?:km|KM)", text)
-    year  = _extract_year(text)
-    brand = _guess_brand(text)
-    return title, price, year, km, brand
 
-def _extract_ad_id(url: str) -> Optional[str]:
-    """
-    Поддержим несколько вариантов:
-    - ...id=123456...
-    - .../kuulutus/123456...
-    - .../id/123456...
-    """
-    m = re.search(r"[?&]id=(\d+)", url)
-    if m:
-        return m.group(1)
-    m = re.search(r"/(\d{5,})($|/|\?)", url)  # любое число 5+ знаков в path
-    if m:
-        return m.group(1)
-    return None
+    price = extract_price(text)
+    km    = extract_km(text)
+    year  = extract_year(text)
+    brand = guess_brand(text)
+
+    return title, price, year, km, brand
 
 def _collect_from_mobile(soup: BeautifulSoup) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
 
-    # 1) Карточки с data-id (если есть)
+    # 1) Явные карточки
     for tag in soup.select("[data-id]"):
         ad_id = tag.get("data-id")
         if not ad_id or not str(ad_id).isdigit():
@@ -118,12 +151,11 @@ def _collect_from_mobile(soup: BeautifulSoup) -> List[Dict[str, Any]]:
             "fetched_at": datetime.now(timezone.utc).isoformat(),
         })
 
-    # 2) Любая ссылка, похожая на объявление
+    # 2) Ссылки, похожие на объявления
     for a in soup.find_all("a", href=True):
         url = _norm_url(a["href"])
         if not url:
             continue
-        # отсекаем явные служебные ссылки
         if "session.php" in url or "login.php" in url:
             continue
         if "soidukid" not in url:
@@ -157,7 +189,6 @@ def _collect_from_mobile(soup: BeautifulSoup) -> List[Dict[str, Any]]:
     return uniq
 
 async def _fetch_html(session, url: str) -> tuple[int, str]:
-    # Возврат: (status, html)
     prox_url = _prox(url)
     async with session.get(prox_url, headers=HDRS) as resp:
         status = resp.status
@@ -165,10 +196,10 @@ async def _fetch_html(session, url: str) -> tuple[int, str]:
     return status, html or ""
 
 async def fetch_latest_listings(session) -> List[Dict[str, Any]]:
-    """Берём мобильную выдачу (при 200) и парсим карточки. Десктоп — запасной."""
+    """Основной источник — мобилка. Десктоп — запасной."""
     all_items: List[Dict[str, Any]] = []
 
-    # mobile — приоритетно (у тебя 200 и много ссылок)
+    # mobile
     try:
         st, html = await _fetch_html(session, MOBILE_URL)
         if st == 200 and html:
@@ -177,12 +208,12 @@ async def fetch_latest_listings(session) -> List[Dict[str, Any]]:
     except Exception:
         pass
 
-    # desktop — как дополнительный источник (может быть 403)
+    # desktop (если вдруг доступен)
     try:
         st, html = await _fetch_html(session, DESKTOP_URL)
         if st == 200 and html:
             soup = BeautifulSoup(html, "html.parser")
-            all_items += _collect_from_mobile(soup)  # мобильный сборщик тоже справится
+            all_items += _collect_from_mobile(soup)  # универсальный сборщик на текст
     except Exception:
         pass
 
@@ -198,7 +229,7 @@ async def fetch_latest_listings(session) -> List[Dict[str, Any]]:
     return uniq[:60]
 
 async def debug_fetch(session):
-    """Диагностика сети/HTML: статусы, размеры и примеры ссылок с учётом прокси."""
+    """Диагностика сети/HTML: статусы, размеры и примеры ссылок."""
     out = {
         "desktop_status": None, "desktop_len": 0, "desktop_links": 0,
         "mobile_status": None, "mobile_len": 0, "mobile_links": 0,
