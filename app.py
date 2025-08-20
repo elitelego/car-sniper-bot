@@ -301,6 +301,32 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # ------------ СКАН И РАССЫЛКА ------------
+def _reject_reason(item: Dict[str, Any], f: Dict[str, Any]) -> Optional[str]:
+    """Возвращает причину отсева, если объявление не проходит фильтр. Учитывает «мягкие» правила."""
+    price = item.get("price_eur")
+    year  = item.get("year")
+    km    = item.get("odometer_km")
+    brand = normalize_brand(item.get("brand") or "")
+
+    if f["price_min"] is not None and price is not None and price < f["price_min"]:
+        return f"price<{f['price_min']} (got {price})"
+    if f["price_max"] is not None and price is not None and price > f["price_max"]:
+        return f"price>{f['price_max']} (got {price})"
+
+    if f["year_min"] is not None and year is not None and year < f["year_min"]:
+        return f"year<{f['year_min']} (got {year})"
+    if f["year_max"] is not None and year is not None and year > f["year_max"]:
+        return f"year>{f['year_max']} (got {year})"
+
+    if f["km_max"] is not None and km is not None and km > f["km_max"]:
+        return f"km>{f['km_max']} (got {km})"
+
+    if f["brands"]:
+        if not brand or brand not in f["brands"]:
+            return f"brand not in {f['brands']} (got {brand or '-'})"
+
+    return None  # не отсекается
+
 async def scan_job(context: ContextTypes.DEFAULT_TYPE):
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
         try:
@@ -315,22 +341,41 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE):
 
     logger.info("Найдено объявлений: %d. Пример: %s", len(listings), listings[0].get("url",""))
 
+    # Диагностика первой десятки
+    for it in listings[:10]:
+        logger.info("DBG item: price=%s year=%s km=%s brand=%s url=%s",
+                    it.get("price_eur"), it.get("year"), it.get("odometer_km"),
+                    it.get("brand"), it.get("url"))
+
     users: List[Tuple[int, str]] = all_users_filters()
     for user_id, filt_text in users:
         f = parse_filters_text(filt_text or "")
         matched = 0
+        rejected = 0
+        reject_samples = {}
+
         for it in listings:
             lid = it.get("id") or it.get("url")
             if not lid or lid in SEEN:
                 continue
-            if is_match(it, f):
+            reason = _reject_reason(it, f)
+            if reason is None:
                 try:
                     await send_listing(user_id, context, it)
                     SEEN.add(lid)
                     matched += 1
                 except Exception as e:
                     logger.exception("Send failed to %s: %s", user_id, e)
-        logger.info("Для chat_id=%s подошло объявлений: %d", user_id, matched)
+            else:
+                rejected += 1
+                reject_samples[reason] = reject_samples.get(reason, 0) + 1
+
+        if rejected:
+            # выведем топ причин отсевов
+            top = ", ".join(f"{k}:{v}" for k, v in list(sorted(reject_samples.items(), key=lambda x: -x[1]))[:3])
+            logger.info("Для chat_id=%s подошло: %d | отсев: %d (%s)", user_id, matched, rejected, top)
+        else:
+            logger.info("Для chat_id=%s подошло: %d | отсев: 0", user_id, matched)
 
 # ------------ СБОРКА И ЗАПУСК ------------
 def build_app():
