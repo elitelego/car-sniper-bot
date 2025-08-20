@@ -23,7 +23,8 @@ logger = logging.getLogger("car-sniper")
 
 # ------------ НАСТРОЙКИ ------------
 BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))
+# Интервал сканирования (сек). Ставим 90 по умолчанию, чтобы не было накладок при долгих запросах.
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "90"))
 
 # Состояния мастера
 PRICE, YEAR, KM, BRANDS = range(4)
@@ -145,7 +146,7 @@ async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ручная проверка парсера: пришлём в чат первые 3 объявления без фильтрации."""
     await update.message.reply_text("⏳ Проверяю auto24…")
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
         try:
             listings = await fetch_latest_listings(session)
         except Exception as e:
@@ -179,9 +180,9 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Нашёл {len(listings)} объявлений. Показал первые {len(preview)}.")
 
 async def cmd_debugraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отладка сети и HTML: покажем статусы, размер, кол-во ссылок и первые 3 URL."""
+    """Отладка сети и HTML: покажем статусы, размер, кол-во ссылок и первые URL."""
     await update.message.reply_text("🔧 Смотрю сеть/HTML auto24…")
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
         try:
             diag = await debug_fetch(session)
         except Exception as e:
@@ -283,7 +284,7 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ------------ СКАН И РАССЫЛКА ------------
 async def scan_job(context: ContextTypes.DEFAULT_TYPE):
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
         try:
             listings = await fetch_latest_listings(session)
         except Exception as e:
@@ -335,8 +336,13 @@ def build_app():
     app.add_handler(CommandHandler("debugraw", cmd_debugraw))
     app.add_handler(conv)
 
-    # Планировщик через JobQueue (обязательно: python-telegram-bot[job-queue])
-    app.job_queue.run_repeating(scan_job, interval=SCAN_INTERVAL, first=5)
+    # Планировщик: не допускаем одновременных запусков и объединяем «пропуски»
+    app.job_queue.run_repeating(
+        scan_job,
+        interval=SCAN_INTERVAL,
+        first=5,
+        job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 60},
+    )
     return app
 
 def main():
