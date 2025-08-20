@@ -23,7 +23,8 @@ logger = logging.getLogger("car-sniper")
 
 # ------------ НАСТРОЙКИ ------------
 BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "120"))  # 2 минуты по умолчанию
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "120"))  # 2 минуты
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")  # если указать, админ-утилиты доступны только этому chat_id
 
 # Состояния мастера
 PRICE, YEAR, KM, BRANDS = range(4)
@@ -131,39 +132,88 @@ def is_match(item: Dict[str, Any], f: Dict[str, Any]) -> bool:
 
     return True
 
+# ------- парсинг модели из title для красивого заголовка -------
+def extract_model_from_title(title: str, brand: Optional[str]) -> str:
+    """
+    Пытаемся убрать из title бренд/год/цену/км — оставить что похоже на модель.
+    Это эвристика, но визуально сильно чище.
+    """
+    if not title:
+        return ""
+    t = title
+
+    # уберём бренд в начале
+    if brand:
+        b = re.escape(brand)
+        t = re.sub(rf"^\s*{b}\s*", "", t, flags=re.IGNORECASE)
+
+    # убрать «€» и числа перед ним
+    t = re.sub(r"(\d{1,3}(?:[ \u00a0]\d{3})+|\d+)\s*€", "", t)
+    # убрать явные годы
+    t = re.sub(r"\b(19|20)\d{2}\b", "", t)
+    # убрать явные пробеги
+    t = re.sub(r"(\d{1,3}(?:[ \u00a0]\d{3})+|\d+)\s*(km|KM|Km|kM)\b", "", t)
+    # нормализовать пробелы
+    t = " ".join(t.split())
+    # если пусто — вернём исходный title
+    return t or title
+
 # ------------ ОТПРАВКА ------------
 async def send_listing(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, listing: Dict[str, Any]):
-    title = listing.get("title") or "Новое объявление"
+    brand = listing.get("brand") or "-"
+    raw_title = listing.get("title") or ""
+    model = extract_model_from_title(raw_title, brand) or raw_title
+
     url   = listing.get("url") or ""
     price = fmt_int(listing.get("price_eur"))
-    year  = listing.get("year")
+    year  = listing.get("year") or "-"
     km    = fmt_int(listing.get("odometer_km"))
-    brand = listing.get("brand") or "-"
     site  = listing.get("site") or "auto24.ee"
+
     text = (
-        f"🔔 *{title}*\n"
-        f"Марка: *{brand}*  •  Год: *{year or '-'}*  •  Пробег: *{km} км*\n"
-        f"Цена: *{price} €*\n"
+        f"🔔 *{brand} {model}*\n\n"
+        f"Марка: *{brand}*\n"
+        f"Год: *{year}*\n"
+        f"Пробег: *{km} км*\n"
+        f"Цена: *{price} €*\n\n"
         f"Источник: *{site}*\n"
         f"[Открыть объявление]({url})"
     )
-    await ctx.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown", disable_web_page_preview=True)
-
-# ------------ КОМАНДЫ ------------
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Привет! Я пришлю тебе новые объявления по твоим фильтрам.\n\n"
-        "🔧 Набери /filter чтобы настроить фильтры пошагово.\n"
-        "Для проверки парсера: /debug\n"
-        "Для отладки сети/HTML: /debugraw"
+    await ctx.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        parse_mode="Markdown",
+        disable_web_page_preview=True
     )
 
-async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"Ваш chat_id: {update.effective_chat.id}")
+# ------------ КОМАНДЫ ------------
+WELCOME_TEXT = (
+    "👋 *Добро пожаловать!*\n\n"
+    "Это удобный бот для *супербыстрого поиска авто* на площадках продаж в Эстонии. "
+    "Настройте фильтры — и подходящие объявления будут приходить *прямо сюда*, сразу после появления.\n\n"
+    "⚙️ Чтобы настроить фильтр, введите команду: /filter"
+)
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(WELCOME_TEXT, parse_mode="Markdown", disable_web_page_preview=True)
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # на всякий случай, если пользователь наберёт /help
+    await update.message.reply_text(WELCOME_TEXT, parse_mode="Markdown", disable_web_page_preview=True)
+
+# --- (админ-утилиты, по желанию — только для ADMIN_CHAT_ID) ---
+def _is_admin(update: Update) -> bool:
+    if not ADMIN_CHAT_ID:
+        return False
+    try:
+        return str(update.effective_chat.id) == str(ADMIN_CHAT_ID)
+    except:
+        return False
 
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ручная проверка парсера: пришлём в чат первые 3 объявления без фильтрации."""
-    await update.message.reply_text("⏳ Проверяю auto24…")
+    if not _is_admin(update):
+        return
+    await update.message.reply_text("⏳ Проверяю источник…")
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
         try:
             listings = await fetch_latest_listings(session)
@@ -171,35 +221,18 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.exception("Debug fetch error: %s", e)
             await update.message.reply_text(f"❌ Ошибка парсера: {e}")
             return
-
     if not listings:
         await update.message.reply_text("⚠️ Парсер вернул 0 объявлений.")
         return
-
     preview = listings[:3]
     for it in preview:
-        url = it.get("url", "")
-        title = it.get("title") or "Объявление"
-        price = it.get("price_eur")
-        year = it.get("year")
-        km = it.get("odometer_km")
-        brand = it.get("brand") or "-"
-        text = (
-            f"🔎 *Проверка*\n"
-            f"{title}\n"
-            f"Марка: {brand} • Год: {year} • Пробег: {km} • Цена: {price} €\n"
-            f"[Открыть]({url})"
-        )
-        try:
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=text, parse_mode="Markdown", disable_web_page_preview=True)
-        except Exception as e:
-            logger.exception("Debug send failed: %s", e)
-
-    await update.message.reply_text(f"✅ Нашёл {len(listings)} объявлений. Показал первые {len(preview)}.")
+        await send_listing(update.effective_chat.id, context, it)
+    await update.message.reply_text(f"✅ Найдено {len(listings)} объявлений. Показал первые {len(preview)}.")
 
 async def cmd_debugraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отладка сети и HTML: покажем статусы, размер, кол-во ссылок и первые URL."""
-    await update.message.reply_text("🔧 Смотрю сеть/HTML auto24…")
+    if not _is_admin(update):
+        return
+    await update.message.reply_text("🔧 Смотрю сеть/HTML…")
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
         try:
             diag = await debug_fetch(session)
@@ -207,7 +240,6 @@ async def cmd_debugraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.exception("DebugRaw error: %s", e)
             await update.message.reply_text(f"❌ Ошибка запроса: {e}")
             return
-
     txt = (
         f"🌐 Источники:\n"
         f"- desktop: status {diag['desktop_status']}, html {diag['desktop_len']} байт, ссылок {diag['desktop_links']}\n"
@@ -301,32 +333,6 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # ------------ СКАН И РАССЫЛКА ------------
-def _reject_reason(item: Dict[str, Any], f: Dict[str, Any]) -> Optional[str]:
-    """Возвращает причину отсева, если объявление не проходит фильтр. Учитывает «мягкие» правила."""
-    price = item.get("price_eur")
-    year  = item.get("year")
-    km    = item.get("odometer_km")
-    brand = normalize_brand(item.get("brand") or "")
-
-    if f["price_min"] is not None and price is not None and price < f["price_min"]:
-        return f"price<{f['price_min']} (got {price})"
-    if f["price_max"] is not None and price is not None and price > f["price_max"]:
-        return f"price>{f['price_max']} (got {price})"
-
-    if f["year_min"] is not None and year is not None and year < f["year_min"]:
-        return f"year<{f['year_min']} (got {year})"
-    if f["year_max"] is not None and year is not None and year > f["year_max"]:
-        return f"year>{f['year_max']} (got {year})"
-
-    if f["km_max"] is not None and km is not None and km > f["km_max"]:
-        return f"km>{f['km_max']} (got {km})"
-
-    if f["brands"]:
-        if not brand or brand not in f["brands"]:
-            return f"brand not in {f['brands']} (got {brand or '-'})"
-
-    return None  # не отсекается
-
 async def scan_job(context: ContextTypes.DEFAULT_TYPE):
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
         try:
@@ -341,41 +347,22 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE):
 
     logger.info("Найдено объявлений: %d. Пример: %s", len(listings), listings[0].get("url",""))
 
-    # Диагностика первой десятки
-    for it in listings[:10]:
-        logger.info("DBG item: price=%s year=%s km=%s brand=%s url=%s",
-                    it.get("price_eur"), it.get("year"), it.get("odometer_km"),
-                    it.get("brand"), it.get("url"))
-
     users: List[Tuple[int, str]] = all_users_filters()
     for user_id, filt_text in users:
         f = parse_filters_text(filt_text or "")
         matched = 0
-        rejected = 0
-        reject_samples = {}
-
         for it in listings:
             lid = it.get("id") or it.get("url")
             if not lid or lid in SEEN:
                 continue
-            reason = _reject_reason(it, f)
-            if reason is None:
+            if is_match(it, f):
                 try:
                     await send_listing(user_id, context, it)
                     SEEN.add(lid)
                     matched += 1
                 except Exception as e:
                     logger.exception("Send failed to %s: %s", user_id, e)
-            else:
-                rejected += 1
-                reject_samples[reason] = reject_samples.get(reason, 0) + 1
-
-        if rejected:
-            # выведем топ причин отсевов
-            top = ", ".join(f"{k}:{v}" for k, v in list(sorted(reject_samples.items(), key=lambda x: -x[1]))[:3])
-            logger.info("Для chat_id=%s подошло: %d | отсев: %d (%s)", user_id, matched, rejected, top)
-        else:
-            logger.info("Для chat_id=%s подошло: %d | отсев: 0", user_id, matched)
+        logger.info("Для chat_id=%s подошло объявлений: %d", user_id, matched)
 
 # ------------ СБОРКА И ЗАПУСК ------------
 def build_app():
@@ -396,13 +383,17 @@ def build_app():
         allow_reentry=True
     )
 
+    # Основные команды для пользователя
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("whoami", cmd_whoami))
-    app.add_handler(CommandHandler("debug", cmd_debug))
-    app.add_handler(CommandHandler("debugraw", cmd_debugraw))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(conv)
 
-    # Планировщик: не допускаем одновременных запусков и объединяем «пропуски»
+    # Админ-команды — только если указан ADMIN_CHAT_ID
+    if ADMIN_CHAT_ID:
+        app.add_handler(CommandHandler("debug", cmd_debug))
+        app.add_handler(CommandHandler("debugraw", cmd_debugraw))
+
+    # Планировщик
     app.job_queue.run_repeating(
         scan_job,
         interval=SCAN_INTERVAL,
