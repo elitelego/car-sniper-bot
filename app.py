@@ -146,7 +146,7 @@ async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ручная проверка парсера: пришлём в чат первые 3 объявления без фильтрации."""
     await update.message.reply_text("⏳ Проверяю auto24…")
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
         try:
             listings = await fetch_latest_listings(session)
         except Exception as e:
@@ -182,7 +182,7 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_debugraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Отладка сети и HTML: покажем статусы, размер, кол-во ссылок и первые URL."""
     await update.message.reply_text("🔧 Смотрю сеть/HTML auto24…")
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
         try:
             diag = await debug_fetch(session)
         except Exception as e:
@@ -284,7 +284,7 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ------------ СКАН И РАССЫЛКА ------------
 async def scan_job(context: ContextTypes.DEFAULT_TYPE):
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
         try:
             listings = await fetch_latest_listings(session)
         except Exception as e:
