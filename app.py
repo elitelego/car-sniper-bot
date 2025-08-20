@@ -11,7 +11,7 @@ from telegram.ext import (
     CallbackQueryHandler, MessageHandler, ConversationHandler, filters
 )
 
-from db import init_db, save_filters, all_users_filters
+from db import init_db, save_filters, all_users_filters, was_already_sent, mark_sent
 from scraper.auto24 import fetch_latest_listings, debug_fetch
 
 # ------------ ЛОГИРОВАНИЕ ------------
@@ -24,7 +24,7 @@ logger = logging.getLogger("car-sniper")
 # ------------ НАСТРОЙКИ ------------
 BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "120"))  # 2 минуты
-ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")  # если указать, админ-утилиты доступны только этому chat_id
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")  # (опц.) кому разрешить /debug, /debugraw
 
 # Состояния мастера
 PRICE, YEAR, KM, BRANDS = range(4)
@@ -36,10 +36,7 @@ BRANDS_ALL = [
     "Hyundai","Kia","Peugeot","Opel","Mazda"
 ]
 
-# Защита от повторной рассылки (на время жизни процесса)
-SEEN: set = set()
-
-# ------------ ВСПОМОГАТЕЛЬНЫЕ ------------
+# ------------ УТИЛИТЫ ------------
 def normalize_brand(b: str) -> str:
     lb = (b or "").strip().lower()
     if lb in ["vw", "volkswagen"]:
@@ -71,111 +68,93 @@ def fmt_int(x: Optional[int]) -> str:
     return f"{x:,}".replace(",", " ")
 
 def parse_filters_text(s: str) -> Dict[str, Any]:
-    # строка формата: "2000-6000|2006-2020|250000|toyota,bmw"
     out = {"price_min":None,"price_max":None,"year_min":None,"year_max":None,"km_max":None,"brands":[]}
     if not s:
         return out
     parts = s.split("|")
-    # price
     if len(parts) > 0 and parts[0]:
         m = re.match(r"^\s*(\d+)\s*-\s*(\d+)\s*$", parts[0])
         if m:
             out["price_min"] = int(m.group(1)); out["price_max"] = int(m.group(2))
-    # year
     if len(parts) > 1 and parts[1]:
         m = re.match(r"^\s*(\d{4})\s*-\s*(\d{4})\s*$", parts[1])
         if m:
             out["year_min"] = int(m.group(1)); out["year_max"] = int(m.group(2))
-    # km
     if len(parts) > 2 and parts[2]:
         try:
             out["km_max"] = int(parts[2].strip())
-        except:
-            pass
-    # brands
+        except: pass
     if len(parts) > 3 and parts[3]:
         brands = [normalize_brand(b) for b in re.split(r"[,\s]+", parts[3]) if b.strip()]
         out["brands"] = brands
     return out
 
 def is_match(item: Dict[str, Any], f: Dict[str, Any]) -> bool:
-    """
-    Мягкая фильтрация:
-    - если поле в объявлении не распознано (None) — НЕ отбрасываем по нему
-    - бренды проверяем только если пользователь их выбирал
-    """
+    """Мягкая фильтрация: пустые поля у объявления не отсекают."""
     price = item.get("price_eur")
     year  = item.get("year")
     km    = item.get("odometer_km")
     brand = normalize_brand(item.get("brand") or "")
 
-    # Цена
     if f["price_min"] is not None and price is not None and price < f["price_min"]:
         return False
     if f["price_max"] is not None and price is not None and price > f["price_max"]:
         return False
-
-    # Год
     if f["year_min"] is not None and year is not None and year < f["year_min"]:
         return False
     if f["year_max"] is not None and year is not None and year > f["year_max"]:
         return False
-
-    # Пробег
     if f["km_max"] is not None and km is not None and km > f["km_max"]:
         return False
-
-    # Бренды (строгая проверка только если указаны)
     if f["brands"]:
         if not brand or brand not in f["brands"]:
             return False
-
     return True
 
-# ------- парсинг модели из title для красивого заголовка -------
+# --- извлечение «модели» из title для красивого заголовка ---
 def extract_model_from_title(title: str, brand: Optional[str]) -> str:
-    """
-    Пытаемся убрать из title бренд/год/цену/км — оставить что похоже на модель.
-    Это эвристика, но визуально сильно чище.
-    """
     if not title:
         return ""
     t = title
-
-    # уберём бренд в начале
     if brand:
         b = re.escape(brand)
         t = re.sub(rf"^\s*{b}\s*", "", t, flags=re.IGNORECASE)
-
-    # убрать «€» и числа перед ним
-    t = re.sub(r"(\d{1,3}(?:[ \u00a0]\d{3})+|\d+)\s*€", "", t)
-    # убрать явные годы
-    t = re.sub(r"\b(19|20)\d{2}\b", "", t)
-    # убрать явные пробеги
-    t = re.sub(r"(\d{1,3}(?:[ \u00a0]\d{3})+|\d+)\s*(km|KM|Km|kM)\b", "", t)
-    # нормализовать пробелы
+    t = re.sub(r"(\d{1,3}(?:[ \u00a0]\d{3})+|\d+)\s*€", "", t)   # цена
+    t = re.sub(r"\b(19|20)\d{2}\b", "", t)                      # год
+    t = re.sub(r"(\d{1,3}(?:[ \u00a0]\d{3})+|\d+)\s*(km|KM)\b", "", t)  # км
     t = " ".join(t.split())
-    # если пусто — вернём исходный title
     return t or title
 
 # ------------ ОТПРАВКА ------------
-async def send_listing(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, listing: Dict[str, Any]):
+def price_change_arrow(prev_price: Optional[int], new_price: Optional[int]) -> str:
+    if prev_price is None or new_price is None:
+        return ""
+    if new_price < prev_price:
+        return " ⬇️"
+    if new_price > prev_price:
+        return " ⬆️"
+    return ""
+
+async def send_listing(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, listing: Dict[str, Any], prev_price: Optional[int]=None):
     brand = listing.get("brand") or "-"
     raw_title = listing.get("title") or ""
     model = extract_model_from_title(raw_title, brand) or raw_title
 
     url   = listing.get("url") or ""
-    price = fmt_int(listing.get("price_eur"))
+    price = listing.get("price_eur")
+    price_txt = fmt_int(price)
     year  = listing.get("year") or "-"
     km    = fmt_int(listing.get("odometer_km"))
     site  = listing.get("site") or "auto24.ee"
+
+    arrow = price_change_arrow(prev_price, price)
 
     text = (
         f"🔔 *{brand} {model}*\n\n"
         f"Марка: *{brand}*\n"
         f"Год: *{year}*\n"
         f"Пробег: *{km} км*\n"
-        f"Цена: *{price} €*\n\n"
+        f"Цена: *{price_txt} €*{arrow}\n\n"
         f"Источник: *{site}*\n"
         f"[Открыть объявление]({url})"
     )
@@ -189,8 +168,8 @@ async def send_listing(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, listing: Di
 # ------------ КОМАНДЫ ------------
 WELCOME_TEXT = (
     "👋 *Добро пожаловать!*\n\n"
-    "Это удобный бот для *супербыстрого поиска авто* на площадках продаж в Эстонии. "
-    "Настройте фильтры — и подходящие объявления будут приходить *прямо сюда*, сразу после появления.\n\n"
+    "Это бот для *супербыстрого поиска авто* на площадках продаж в Эстонии. "
+    "Настройте фильтры — и подходящие объявления будут приходить *прямо сюда* сразу после появления.\n\n"
     "⚙️ Чтобы настроить фильтр, введите команду: /filter"
 )
 
@@ -198,10 +177,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(WELCOME_TEXT, parse_mode="Markdown", disable_web_page_preview=True)
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # на всякий случай, если пользователь наберёт /help
     await update.message.reply_text(WELCOME_TEXT, parse_mode="Markdown", disable_web_page_preview=True)
 
-# --- (админ-утилиты, по желанию — только для ADMIN_CHAT_ID) ---
 def _is_admin(update: Update) -> bool:
     if not ADMIN_CHAT_ID:
         return False
@@ -215,31 +192,20 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text("⏳ Проверяю источник…")
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
-        try:
-            listings = await fetch_latest_listings(session)
-        except Exception as e:
-            logger.exception("Debug fetch error: %s", e)
-            await update.message.reply_text(f"❌ Ошибка парсера: {e}")
-            return
+        listings = await fetch_latest_listings(session)
     if not listings:
         await update.message.reply_text("⚠️ Парсер вернул 0 объявлений.")
         return
-    preview = listings[:3]
-    for it in preview:
-        await send_listing(update.effective_chat.id, context, it)
-    await update.message.reply_text(f"✅ Найдено {len(listings)} объявлений. Показал первые {len(preview)}.")
+    for it in listings[:3]:
+        await send_listing(update.effective_chat.id, context, it, None)
+    await update.message.reply_text(f"✅ Найдено {len(listings)} объявлений. Показал первые 3.")
 
 async def cmd_debugraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return
     await update.message.reply_text("🔧 Смотрю сеть/HTML…")
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
-        try:
-            diag = await debug_fetch(session)
-        except Exception as e:
-            logger.exception("DebugRaw error: %s", e)
-            await update.message.reply_text(f"❌ Ошибка запроса: {e}")
-            return
+        diag = await debug_fetch(session)
     txt = (
         f"🌐 Источники:\n"
         f"- desktop: status {diag['desktop_status']}, html {diag['desktop_len']} байт, ссылок {diag['desktop_links']}\n"
@@ -302,10 +268,8 @@ async def brands_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         brand = data.split(":", 1)[1]
         sel = context.user_data["filt"].get("brands", [])
         nb = normalize_brand(brand)
-        if nb in sel:
-            sel.remove(nb)
-        else:
-            sel.append(nb)
+        if nb in sel: sel.remove(nb)
+        else: sel.append(nb)
         context.user_data["filt"]["brands"] = sel
         await q.edit_message_reply_markup(reply_markup=brands_keyboard(sel))
         return BRANDS
@@ -352,17 +316,24 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE):
         f = parse_filters_text(filt_text or "")
         matched = 0
         for it in listings:
-            lid = it.get("id") or it.get("url")
-            if not lid or lid in SEEN:
+            listing_id = it.get("id") or it.get("url")
+            if not listing_id:
                 continue
+
+            # если уже отправляли такую же цену — пропускаем
+            if was_already_sent(user_id, listing_id, it.get("price_eur")):
+                continue
+
             if is_match(it, f):
+                prev_price = None  # можно доработать: достать последнюю запись по listing_id для стрелочки
                 try:
-                    await send_listing(user_id, context, it)
-                    SEEN.add(lid)
+                    await send_listing(user_id, context, it, prev_price)
+                    mark_sent(user_id, listing_id, it.get("price_eur"), it.get("title") or "", it.get("url") or "")
                     matched += 1
                 except Exception as e:
                     logger.exception("Send failed to %s: %s", user_id, e)
-        logger.info("Для chat_id=%s подошло объявлений: %d", user_id, matched)
+
+        logger.info("Для chat_id=%s отправлено объявлений: %d", user_id, matched)
 
 # ------------ СБОРКА И ЗАПУСК ------------
 def build_app():
@@ -383,17 +354,16 @@ def build_app():
         allow_reentry=True
     )
 
-    # Основные команды для пользователя
+    # Для пользователя — только дружелюбные команды
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(conv)
 
-    # Админ-команды — только если указан ADMIN_CHAT_ID
+    # Админ-команды (опционально)
     if ADMIN_CHAT_ID:
         app.add_handler(CommandHandler("debug", cmd_debug))
         app.add_handler(CommandHandler("debugraw", cmd_debugraw))
 
-    # Планировщик
     app.job_queue.run_repeating(
         scan_job,
         interval=SCAN_INTERVAL,
