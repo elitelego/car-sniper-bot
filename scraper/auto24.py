@@ -1,3 +1,4 @@
+import os
 import re
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone
@@ -5,8 +6,23 @@ from bs4 import BeautifulSoup
 
 DESKTOP_URL = "https://www.auto24.ee/soidukid/kasutatud/"
 MOBILE_URL  = "https://m.auto24.ee/soidukid/kasutatud/"
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+
+# Если задан SCRAPER_URL_TMPL, все запросы пойдут через него:
+# пример для ScraperAPI:
+# SCRAPER_URL_TMPL = "https://api.scraperapi.com/?api_key=XXX&country_code=EE&keep_headers=true&url={url}"
+SCRAPER_URL_TMPL = os.getenv("SCRAPER_URL_TMPL")
+
+# Доносимся как «настоящий» браузер + переносим заголовки через прокси (keep_headers=true)
+HDRS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "et-EE,et;q=0.9,en;q=0.8,ru;q=0.7",
+    "Referer": "https://www.auto24.ee/",
+    "Cache-Control": "no-cache",
 }
 
 BRAND_LIST = [
@@ -14,6 +30,11 @@ BRAND_LIST = [
     "Volvo","Honda","Ford","Nissan","Hyundai","Kia","Peugeot","Opel","Mazda","Renault"
 ]
 CANON = {"vw":"Volkswagen","volkswagen":"Volkswagen","mercedes":"Mercedes-Benz","mercedes-benz":"Mercedes-Benz","škoda":"Skoda","skoda":"Skoda"}
+
+def _prox(url: str) -> str:
+    if SCRAPER_URL_TMPL:
+        return SCRAPER_URL_TMPL.format(url=url)
+    return url
 
 def _norm_url(href: str) -> Optional[str]:
     if not href:
@@ -63,7 +84,7 @@ def _parse_card_from_tag(tag) -> Dict[str, Any]:
 def _collect_from_soup(soup: BeautifulSoup) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
 
-    # 1) Явные карточки с data-id
+    # 1) Карточки с data-id
     for tag in soup.select("[data-id]"):
         ad_id = tag.get("data-id")
         if not ad_id or not str(ad_id).isdigit():
@@ -93,7 +114,6 @@ def _collect_from_soup(soup: BeautifulSoup) -> List[Dict[str, Any]]:
             continue
         ad_id = m.group(1)
 
-        # возьмём ближайший контейнер
         card = a.find_parent(["article","div","li"]) or a
         text = " ".join(card.get_text(" ").split())
         title = a.get_text(strip=True) or "Listing"
@@ -124,28 +144,32 @@ def _collect_from_soup(soup: BeautifulSoup) -> List[Dict[str, Any]]:
         uniq.append(it)
     return uniq
 
+async def _fetch_html(session, url: str) -> tuple[int, str]:
+    # Возврат: (status, html)
+    prox_url = _prox(url)
+    async with session.get(prox_url, headers=HDRS) as resp:
+        status = resp.status
+        html = await resp.text()
+    return status, html or ""
+
 async def fetch_latest_listings(session) -> List[Dict[str, Any]]:
-    """Пытаемся получить объявления с десктопа и мобилки; возвращаем до 60 уникальных."""
+    """Пытаемся получить объявления с десктопа и мобилки; при 403 рекомендуем прокси."""
     all_items: List[Dict[str, Any]] = []
 
     # desktop
     try:
-        async with session.get(DESKTOP_URL, headers=HEADERS) as resp:
-            desktop_status = resp.status
-            desktop_html = await resp.text()
-        if desktop_status == 200 and desktop_html:
-            soup = BeautifulSoup(desktop_html, "html.parser")
+        st, html = await _fetch_html(session, DESKTOP_URL)
+        if st == 200 and html:
+            soup = BeautifulSoup(html, "html.parser")
             all_items += _collect_from_soup(soup)
     except Exception:
         pass
 
     # mobile
     try:
-        async with session.get(MOBILE_URL, headers=HEADERS) as resp:
-            mobile_status = resp.status
-            mobile_html = await resp.text()
-        if mobile_status == 200 and mobile_html:
-            soup = BeautifulSoup(mobile_html, "html.parser")
+        st, html = await _fetch_html(session, MOBILE_URL)
+        if st == 200 and html:
+            soup = BeautifulSoup(html, "html.parser")
             all_items += _collect_from_soup(soup)
     except Exception:
         pass
@@ -162,37 +186,36 @@ async def fetch_latest_listings(session) -> List[Dict[str, Any]]:
     return uniq[:60]
 
 async def debug_fetch(session):
-    """Диагностика сети/HTML: статусы, размеры и примеры ссылок"""
+    """Диагностика сети/HTML: статусы, размеры и примеры ссылок с учётом прокси."""
     out = {
         "desktop_status": None, "desktop_len": 0, "desktop_links": 0,
         "mobile_status": None, "mobile_len": 0, "mobile_links": 0,
         "sample_links": []
     }
+
     # desktop
     try:
-        async with session.get(DESKTOP_URL, headers=HEADERS) as resp:
-            out["desktop_status"] = resp.status
-            html = await resp.text()
-            out["desktop_len"] = len(html or "")
-            if html:
-                soup = BeautifulSoup(html, "html.parser")
-                links = [a.get("href") for a in soup.find_all("a", href=True)]
-                out["desktop_links"] = len(links)
-                out["sample_links"] += [str(l) for l in links[:3]]
+        st, html = await _fetch_html(session, DESKTOP_URL)
+        out["desktop_status"] = st
+        out["desktop_len"] = len(html or "")
+        if html:
+            soup = BeautifulSoup(html, "html.parser")
+            links = [a.get("href") for a in soup.find_all("a", href=True)]
+            out["desktop_links"] = len(links)
+            out["sample_links"] += [str(_norm_url(l) or l) for l in links[:3]]
     except Exception as e:
         out["sample_links"].append(f"desktop error: {e}")
 
     # mobile
     try:
-        async with session.get(MOBILE_URL, headers=HEADERS) as resp:
-            out["mobile_status"] = resp.status
-            html = await resp.text()
-            out["mobile_len"] = len(html or "")
-            if html:
-                soup = BeautifulSoup(html, "html.parser")
-                links = [a.get("href") for a in soup.find_all("a", href=True)]
-                out["mobile_links"] = len(links)
-                out["sample_links"] += [str(l) for l in links[:3]]
+        st, html = await _fetch_html(session, MOBILE_URL)
+        out["mobile_status"] = st
+        out["mobile_len"] = len(html or "")
+        if html:
+            soup = BeautifulSoup(html, "html.parser")
+            links = [a.get("href") for a in soup.find_all("a", href=True)]
+            out["mobile_links"] = len(links)
+            out["sample_links"] += [str(_norm_url(l) or l) for l in links[:3]]
     except Exception as e:
         out["sample_links"].append(f"mobile error: {e}")
 
