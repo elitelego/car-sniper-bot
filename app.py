@@ -23,8 +23,7 @@ logger = logging.getLogger("car-sniper")
 
 # ------------ НАСТРОЙКИ ------------
 BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
-# Интервал сканирования (сек). Ставим 90 по умолчанию, чтобы не было накладок при долгих запросах.
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "90"))
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "120"))  # 2 минуты по умолчанию
 
 # Состояния мастера
 PRICE, YEAR, KM, BRANDS = range(4)
@@ -99,18 +98,37 @@ def parse_filters_text(s: str) -> Dict[str, Any]:
     return out
 
 def is_match(item: Dict[str, Any], f: Dict[str, Any]) -> bool:
+    """
+    Мягкая фильтрация:
+    - если поле в объявлении не распознано (None) — НЕ отбрасываем по нему
+    - бренды проверяем только если пользователь их выбирал
+    """
     price = item.get("price_eur")
     year  = item.get("year")
     km    = item.get("odometer_km")
     brand = normalize_brand(item.get("brand") or "")
 
-    if f["price_min"] is not None and (price is None or price < f["price_min"]): return False
-    if f["price_max"] is not None and (price is None or price > f["price_max"]): return False
-    if f["year_min"]  is not None and (year  is None or year  < f["year_min"]):  return False
-    if f["year_max"]  is not None and (year  is None or year  > f["year_max"]):  return False
-    if f["km_max"]    is not None and (km    is None or km    > f["km_max"]):    return False
+    # Цена
+    if f["price_min"] is not None and price is not None and price < f["price_min"]:
+        return False
+    if f["price_max"] is not None and price is not None and price > f["price_max"]:
+        return False
+
+    # Год
+    if f["year_min"] is not None and year is not None and year < f["year_min"]:
+        return False
+    if f["year_max"] is not None and year is not None and year > f["year_max"]:
+        return False
+
+    # Пробег
+    if f["km_max"] is not None and km is not None and km > f["km_max"]:
+        return False
+
+    # Бренды (строгая проверка только если указаны)
     if f["brands"]:
-        if not brand or brand not in f["brands"]: return False
+        if not brand or brand not in f["brands"]:
+            return False
+
     return True
 
 # ------------ ОТПРАВКА ------------
@@ -121,7 +139,7 @@ async def send_listing(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, listing: Di
     year  = listing.get("year")
     km    = fmt_int(listing.get("odometer_km"))
     brand = listing.get("brand") or "-"
-    site  = listing.get("site") or ""
+    site  = listing.get("site") or "auto24.ee"
     text = (
         f"🔔 *{title}*\n"
         f"Марка: *{brand}*  •  Год: *{year or '-'}*  •  Пробег: *{km} км*\n"
@@ -146,7 +164,7 @@ async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ручная проверка парсера: пришлём в чат первые 3 объявления без фильтрации."""
     await update.message.reply_text("⏳ Проверяю auto24…")
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
         try:
             listings = await fetch_latest_listings(session)
         except Exception as e:
@@ -182,7 +200,7 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_debugraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Отладка сети и HTML: покажем статусы, размер, кол-во ссылок и первые URL."""
     await update.message.reply_text("🔧 Смотрю сеть/HTML auto24…")
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
         try:
             diag = await debug_fetch(session)
         except Exception as e:
@@ -284,7 +302,7 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ------------ СКАН И РАССЫЛКА ------------
 async def scan_job(context: ContextTypes.DEFAULT_TYPE):
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
         try:
             listings = await fetch_latest_listings(session)
         except Exception as e:
@@ -300,6 +318,7 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE):
     users: List[Tuple[int, str]] = all_users_filters()
     for user_id, filt_text in users:
         f = parse_filters_text(filt_text or "")
+        matched = 0
         for it in listings:
             lid = it.get("id") or it.get("url")
             if not lid or lid in SEEN:
@@ -308,8 +327,10 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE):
                 try:
                     await send_listing(user_id, context, it)
                     SEEN.add(lid)
+                    matched += 1
                 except Exception as e:
                     logger.exception("Send failed to %s: %s", user_id, e)
+        logger.info("Для chat_id=%s подошло объявлений: %d", user_id, matched)
 
 # ------------ СБОРКА И ЗАПУСК ------------
 def build_app():
