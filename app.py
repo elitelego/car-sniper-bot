@@ -12,7 +12,7 @@ from telegram.ext import (
 )
 
 from db import init_db, save_filters, all_users_filters
-from scraper.auto24 import fetch_latest_listings
+from scraper.auto24 import fetch_latest_listings, debug_fetch
 
 # ------------ ЛОГИРОВАНИЕ ------------
 logging.basicConfig(
@@ -82,7 +82,7 @@ def parse_filters_text(s: str) -> Dict[str, Any]:
             out["price_min"] = int(m.group(1)); out["price_max"] = int(m.group(2))
     # year
     if len(parts) > 1 and parts[1]:
-        m = re.match(r"^\s*(\d{4})-(\d{4})\s*$", parts[1])
+        m = re.match(r"^\s*(\d{4})\s*-\s*(\d{4})\s*$", parts[1])
         if m:
             out["year_min"] = int(m.group(1)); out["year_max"] = int(m.group(2))
     # km
@@ -135,7 +135,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Я пришлю тебе новые объявления по твоим фильтрам.\n\n"
         "🔧 Набери /filter чтобы настроить фильтры пошагово.\n"
-        "Для проверки парсера: /debug"
+        "Для проверки парсера: /debug\n"
+        "Для отладки сети/HTML: /debugraw"
     )
 
 async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -153,7 +154,7 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     if not listings:
-        await update.message.reply_text("⚠️ Парсер вернул 0 объявлений. Попробуем позже или расширим эвристику.")
+        await update.message.reply_text("⚠️ Парсер вернул 0 объявлений.")
         return
 
     preview = listings[:3]
@@ -177,9 +178,26 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(f"✅ Нашёл {len(listings)} объявлений. Показал первые {len(preview)}.")
 
-# ------------ МАСТЕР ФИЛЬТРОВ ------------
-PRICE, YEAR, KM, BRANDS = range(4)
+async def cmd_debugraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отладка сети и HTML: покажем статусы, размер, кол-во ссылок и первые 3 URL."""
+    await update.message.reply_text("🔧 Смотрю сеть/HTML auto24…")
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+        try:
+            diag = await debug_fetch(session)
+        except Exception as e:
+            logger.exception("DebugRaw error: %s", e)
+            await update.message.reply_text(f"❌ Ошибка запроса: {e}")
+            return
 
+    txt = (
+        f"🌐 Источники:\n"
+        f"- desktop: status {diag['desktop_status']}, html {diag['desktop_len']} байт, ссылок {diag['desktop_links']}\n"
+        f"- mobile:  status {diag['mobile_status']},  html {diag['mobile_len']} байт, ссылок {diag['mobile_links']}\n"
+        f"Примеры ссылок:\n" + ("\n".join(diag["sample_links"]) if diag["sample_links"] else "—")
+    )
+    await update.message.reply_text(txt[:3900], disable_web_page_preview=True)
+
+# ------------ МАСТЕР ФИЛЬТРОВ ------------
 async def filter_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["filt"] = {"price_min": None,"price_max": None,"year_min": None,"year_max": None,"km_max": None,"brands": []}
     await update.message.reply_text("Укажи диапазон цены (например: 2000-6000):")
@@ -314,6 +332,7 @@ def build_app():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("debug", cmd_debug))
+    app.add_handler(CommandHandler("debugraw", cmd_debugraw))
     app.add_handler(conv)
 
     # Планировщик через JobQueue (обязательно: python-telegram-bot[job-queue])
